@@ -122,6 +122,9 @@ def add_action_config(parser: argparse.ArgumentParser):
     group = _get_group(parser, "action")
     group.add_argument("--action_type", type=str, choices=["state_joint", "state_pose", "action_joint", "action_pose"], default=None, help="Which action/state slice to load from parquet.")
     group.add_argument("--action_stat_path", type=str, default=None, help="Path to action/state normalization stats (stat.json). Defaults to dataset_base_path/meta/stat.json if present.")
+    group.add_argument("--track_num_points_per_view", type=int, default=256, help="Number of cotracker points to sample per view from the first-frame visible set.")
+    group.add_argument("--track_num_views", type=int, default=None, help="Optional override for the number of track/video views. When omitted, training infers it from metadata.")
+    group.add_argument("--track_noise_std", type=float, default=0.01, help="Std of Gaussian noise applied to sampled cotracker coordinates during training. Set to 0 to disable.")
     return parser
 
 def add_infer_config(parser: argparse.ArgumentParser):

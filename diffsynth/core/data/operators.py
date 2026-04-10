@@ -376,6 +376,164 @@ class ResolvePromptEmbPath(DataProcessingOperator):
         return os.path.join(self.base_path, path)
 
 
+class LoadCotrackerTrack(DataProcessingOperator):
+    def __init__(
+        self,
+        base_path="",
+        num_frames=81,
+        time_division_factor=4,
+        time_division_remainder=1,
+        num_points_per_view=256,
+    ):
+        self.base_path = base_path
+        self.num_frames = int(num_frames)
+        self.time_division_factor = int(time_division_factor)
+        self.time_division_remainder = int(time_division_remainder)
+        self.num_points_per_view = int(num_points_per_view)
+
+    def get_num_frames(self, total_frames):
+        num_frames = int(self.num_frames)
+        if int(total_frames) < num_frames:
+            num_frames = int(total_frames)
+            while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
+                num_frames -= 1
+        return num_frames
+
+    def _extract_track_items(self, data):
+        default_start_frame = None
+        default_end_frame = None
+        default_frame_indices = None
+        if isinstance(data, dict) and "data" not in data:
+            default_start_frame = data.get("start_frame")
+            default_end_frame = data.get("end_frame")
+            default_frame_indices = data.get("frame_indices")
+            data = data.get("track")
+
+        if data is None:
+            return None, default_start_frame, default_end_frame, default_frame_indices
+
+        if isinstance(data, (str, os.PathLike, dict)):
+            data = [data]
+        if not isinstance(data, (list, tuple)) or len(data) == 0:
+            raise TypeError("Expected track metadata as a non-empty list of paths.")
+        return list(data), default_start_frame, default_end_frame, default_frame_indices
+
+    def _resolve_track_info(self, data, default_start_frame=None, default_end_frame=None, default_frame_indices=None):
+        if isinstance(data, dict):
+            track_rel = data.get("data")
+            start_frame = data.get("start_frame", default_start_frame)
+            end_frame = data.get("end_frame", default_end_frame)
+            frame_indices = data.get("frame_indices", default_frame_indices)
+        else:
+            track_rel = data
+            start_frame = default_start_frame
+            end_frame = default_end_frame
+            frame_indices = default_frame_indices
+
+        if track_rel is None:
+            return None, start_frame, end_frame, frame_indices
+
+        if isinstance(track_rel, os.PathLike):
+            track_rel = os.fspath(track_rel)
+        if not isinstance(track_rel, str) or not track_rel:
+            raise TypeError(f"Unexpected track path payload: {track_rel!r}")
+
+        if os.path.isabs(track_rel):
+            track_path = track_rel
+        else:
+            track_path = os.path.join(self.base_path, track_rel)
+        if frame_indices is not None:
+            frame_indices = [int(frame_id) for frame_id in frame_indices]
+        return track_path, start_frame, end_frame, frame_indices
+
+    def _select_frame_indices(self, total_frames, start_frame, end_frame, frame_indices):
+        if frame_indices is not None:
+            indices = [int(frame_id) for frame_id in frame_indices]
+        else:
+            if start_frame is None:
+                start_frame = 0
+            if end_frame is None:
+                end_frame = total_frames - 1
+            start_frame = int(start_frame)
+            end_frame = int(end_frame)
+            num_frames = self.get_num_frames(end_frame - start_frame + 1)
+            indices = list(range(start_frame, start_frame + num_frames))
+
+        if len(indices) == 0:
+            raise ValueError("Track frame selection is empty.")
+        invalid = [frame_id for frame_id in indices if frame_id < 0 or frame_id >= total_frames]
+        if invalid:
+            raise IndexError(f"Track frame indices out of range: {invalid[:8]} (total_frames={total_frames})")
+        return indices
+
+    def _sample_point_indices(self, visible_mask: np.ndarray, total_points: int) -> np.ndarray:
+        visible_ids = np.flatnonzero(visible_mask.astype(bool))
+        if len(visible_ids) == 0:
+            visible_ids = np.arange(total_points, dtype=np.int64)
+        if len(visible_ids) >= self.num_points_per_view:
+            return np.random.choice(visible_ids, size=self.num_points_per_view, replace=False)
+
+        base = np.random.permutation(visible_ids)
+        remaining = self.num_points_per_view - len(base)
+        if len(base) == 0:
+            pad_source = np.arange(total_points, dtype=np.int64)
+        else:
+            pad_source = base
+        pad = np.random.choice(pad_source, size=remaining, replace=True)
+        return np.concatenate([base, pad], axis=0)
+
+    def __call__(self, data, start_frame=None, end_frame=None, frame_indices=None):
+        track_items, default_start_frame, default_end_frame, default_frame_indices = self._extract_track_items(data)
+        if track_items is None:
+            return None
+
+        if start_frame is not None:
+            default_start_frame = start_frame
+        if end_frame is not None:
+            default_end_frame = end_frame
+        if frame_indices is not None:
+            default_frame_indices = frame_indices
+
+        views = []
+        for item in track_items:
+            track_path, item_start_frame, item_end_frame, item_frame_indices = self._resolve_track_info(
+                item,
+                default_start_frame=default_start_frame,
+                default_end_frame=default_end_frame,
+                default_frame_indices=default_frame_indices,
+            )
+            if track_path is None:
+                continue
+
+            with np.load(track_path) as track_file:
+                if "tracks" not in track_file or "vis" not in track_file:
+                    raise KeyError(f"Track file must contain `tracks` and `vis`: {track_path}")
+                tracks = np.asarray(track_file["tracks"], dtype=np.float32)
+                vis = np.asarray(track_file["vis"], dtype=bool)
+
+            if tracks.ndim != 3 or tracks.shape[-1] != 2:
+                raise ValueError(f"Unexpected track shape {tracks.shape} in {track_path}")
+            if vis.ndim != 2 or vis.shape != tracks.shape[:2]:
+                raise ValueError(f"Unexpected visibility shape {vis.shape} for tracks {tracks.shape} in {track_path}")
+
+            selected_frame_indices = self._select_frame_indices(
+                tracks.shape[0],
+                item_start_frame,
+                item_end_frame,
+                item_frame_indices,
+            )
+            sampled_tracks = tracks[selected_frame_indices]
+            sampled_vis = vis[selected_frame_indices]
+            point_indices = self._sample_point_indices(sampled_vis[0], sampled_tracks.shape[1])
+            views.append(sampled_tracks[:, point_indices, :])
+
+        if len(views) == 0:
+            return None
+
+        combined = np.concatenate(views, axis=1)
+        return combined[None, ...].astype(np.float32, copy=False)
+
+
 OBS_ACTION_NAMES = [
     "left_arm_joint_1_rad",
     "left_arm_joint_2_rad",

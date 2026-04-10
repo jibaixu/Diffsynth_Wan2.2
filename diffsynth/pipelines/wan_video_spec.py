@@ -221,8 +221,9 @@ class WanModuleSpec:
 
         if self.action_enabled:
             ensure("action")
+            ensure("track")
         else:
-            keys = [key for key in keys if key != "action"]
+            keys = [key for key in keys if key not in ("action", "track")]
 
         model_paths: list[WanModelPath] = []
         for module in self.weight_modules:

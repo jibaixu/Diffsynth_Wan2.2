@@ -12,6 +12,7 @@ from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 
 from ..models.wan_video_dit import WanModel, sinusoidal_embedding_1d
 from ..models.wan_video_action_encoder import WanVideoActionEncoder
+from ..models.wan_video_track_encoder import WanVideoActionTrackFuser, WanVideoTrackEncoder
 from ..models.wan_video_text_encoder import WanTextEncoder, HuggingfaceTokenizer
 from ..models.wan_video_vae import WanVideoVAE
 from ..models.wan_video_image_encoder import WanImageEncoder
@@ -43,7 +44,14 @@ class WanVideoPipeline(BasePipeline):
         self.image_encoder: WanImageEncoder = None
         self.dit: WanModel = None
         self.action_encoder: WanVideoActionEncoder = None
+        self.track_encoder: WanVideoTrackEncoder = None
+        self.action_track_fuser: WanVideoActionTrackFuser = None
         self.vae: WanVideoVAE = None
+        self.num_track_views = 1
+        self.track_num_points_per_view = 256
+        self.track_noise_std = 0.0
+        self.track_clip_min = -0.25
+        self.track_clip_max = 1.25
         self.in_iteration_models = ("dit",)
         self.units = [
             WanVideoUnit_ShapeChecker(),
@@ -72,6 +80,9 @@ class WanVideoPipeline(BasePipeline):
         redirect_common_files: bool = True,
         vram_limit: float = None,
         modules: Optional[list[str]] = None,
+        track_num_points_per_view: int = 256,
+        num_track_views: int = 1,
+        track_noise_std: float = 0.0,
     ):
         module_spec = WanModuleSpec.parse(modules)
         modules = list(module_spec.modules)
@@ -98,6 +109,9 @@ class WanVideoPipeline(BasePipeline):
             torch_dtype=torch_dtype,
             modules=modules,
         )
+        pipe.track_num_points_per_view = max(1, int(track_num_points_per_view))
+        pipe.num_track_views = max(1, int(num_track_views))
+        pipe.track_noise_std = max(0.0, float(track_noise_std))
         model_kwargs_overrides = {
             "wan_video_dit": {
                 "has_text_input": module_spec.has_text_input_for_dit,
@@ -116,21 +130,41 @@ class WanVideoPipeline(BasePipeline):
         pipe.vae = model_pool.fetch_model("wan_video_vae")
         pipe.image_encoder = model_pool.fetch_model("wan_video_image_encoder")
         pipe.action_encoder = model_pool.fetch_model("wan_video_action_encoder") if action_enabled else None
+        pipe.track_encoder = model_pool.fetch_model("wan_video_track_encoder") if action_enabled else None
+        pipe.action_track_fuser = model_pool.fetch_model("wan_video_action_track_fuser") if action_enabled else None
 
-        if action_enabled and pipe.action_encoder is None:
+        if action_enabled:
             action_dim = 14
             dim = getattr(pipe.dit, "dim", 1536) if pipe.dit is not None else 1536
-            if module_spec.action_mode == "adaln":
-                pipe.action_encoder = WanVideoActionEncoder(
-                    action_dim=action_dim,
-                    dim=dim,
-                    num_action_per_chunk=81,
-                    in_features=None,
-                    hidden_features=dim * 4,
-                )
-            else:
-                pipe.action_encoder = WanVideoActionEncoder(action_dim=action_dim, dim=dim)
+            track_dim = pipe.track_num_points_per_view * pipe.num_track_views * 2
+            if pipe.action_encoder is None:
+                if module_spec.action_mode == "adaln":
+                    pipe.action_encoder = WanVideoActionEncoder(
+                        action_dim=action_dim,
+                        dim=dim,
+                        num_action_per_chunk=81,
+                        in_features=None,
+                        hidden_features=dim * 4,
+                    )
+                else:
+                    pipe.action_encoder = WanVideoActionEncoder(action_dim=action_dim, dim=dim)
+            if pipe.track_encoder is None:
+                if module_spec.action_mode == "adaln":
+                    pipe.track_encoder = WanVideoTrackEncoder(
+                        track_dim=track_dim,
+                        dim=dim,
+                        num_track_per_chunk=81,
+                        in_features=None,
+                        hidden_features=dim * 4,
+                    )
+                else:
+                    pipe.track_encoder = WanVideoTrackEncoder(track_dim=track_dim, dim=dim)
+            if pipe.action_track_fuser is None:
+                pipe.action_track_fuser = WanVideoActionTrackFuser(dim=dim)
+
             pipe.action_encoder = pipe.action_encoder.to(dtype=pipe.torch_dtype, device=pipe.device)
+            pipe.track_encoder = pipe.track_encoder.to(dtype=pipe.torch_dtype, device=pipe.device)
+            pipe.action_track_fuser = pipe.action_track_fuser.to(dtype=pipe.torch_dtype, device=pipe.device)
 
         # Size division factor
         if pipe.vae is not None:
@@ -168,6 +202,7 @@ class WanVideoPipeline(BasePipeline):
         num_history_frames=1,
         # Action conditioning
         action: Optional[torch.Tensor] = None,
+        track: Optional[torch.Tensor] = None,
         # Classifier-free guidance
         cfg_scale: Optional[float] = 5.0,
         # Scheduler
@@ -207,6 +242,7 @@ class WanVideoPipeline(BasePipeline):
             "seed": seed, "rand_device": rand_device,
             "height": height, "width": width, "num_frames": num_frames, "num_history_frames": num_history_frames,
             "action": action,
+            "track": track,
             "cfg_scale": cfg_scale,
             "sigma_shift": sigma_shift,
             "tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride,
@@ -403,38 +439,118 @@ class WanVideoUnit_ActionEmbedder(PipelineUnit): # infer & train
     """
     def __init__(self):
         super().__init__(
-            input_params=("action", "num_frames"),
+            input_params=("action", "track", "num_frames", "input_video"),
             output_params=("action_emb",),
-            onload_model_names=("action_encoder",)
+            onload_model_names=("action_encoder", "track_encoder", "action_track_fuser")
         )
 
-    def process(self, pipe: WanVideoPipeline, action, num_frames) -> dict:
+    @staticmethod
+    def _fit_sequence_length(sequence: torch.Tensor, target_length: int) -> torch.Tensor:
+        current_length = int(sequence.shape[1])
+        if current_length == target_length:
+            return sequence
+        if current_length > target_length:
+            return sequence[:, :target_length]
+        if current_length <= 0:
+            raise ValueError("Cannot pad an empty condition sequence.")
+        pad_frames = target_length - current_length
+        pad = sequence[:, -1:, ...].repeat(1, pad_frames, *([1] * (sequence.ndim - 2)))
+        return torch.cat([sequence, pad], dim=1)
+
+    @staticmethod
+    def _chunk_condition_for_latents(sequence: torch.Tensor, num_frames: int) -> torch.Tensor:
+        length = (num_frames - 1) // 4 + 1
+        sequence = torch.concat(
+            [torch.repeat_interleave(sequence[:, 0:1], repeats=4, dim=1), sequence[:, 1:]],
+            dim=1,
+        )
+        return sequence.contiguous().view(sequence.shape[0], length, 4, *sequence.shape[2:])
+
+    @staticmethod
+    def _downsample_action_condition(sequence: torch.Tensor, num_frames: int) -> torch.Tensor:
+        return WanVideoUnit_ActionEmbedder._chunk_condition_for_latents(sequence, num_frames).mean(dim=2)
+
+    @staticmethod
+    def _downsample_track_condition(sequence: torch.Tensor, num_frames: int) -> torch.Tensor:
+        # Preserve real per-frame coordinates instead of averaging track positions across time.
+        return WanVideoUnit_ActionEmbedder._chunk_condition_for_latents(sequence, num_frames).select(dim=2, index=3).contiguous()
+
+    @staticmethod
+    def _ensure_track_tensor(track: torch.Tensor, expected_points: int) -> torch.Tensor:
+        if track.ndim == 4:
+            if track.shape[-1] != 2:
+                raise ValueError(f"`track` last dim must be 2, got {tuple(track.shape)}")
+            track_points = int(track.shape[2])
+            if track_points != expected_points:
+                raise ValueError(f"`track` point count mismatch: expected {expected_points}, got {track_points}")
+            return track
+        if track.ndim == 3:
+            expected_width = expected_points * 2
+            if track.shape[-1] != expected_width:
+                raise ValueError(f"`track` width mismatch: expected {expected_width}, got {int(track.shape[-1])}")
+            return rearrange(track, "b t (n c) -> b t n c", c=2).contiguous()
+        raise ValueError(f"`track` must have shape (B,T,N,2) or (B,T,N*2), got {tuple(track.shape)}")
+
+    @staticmethod
+    def _apply_track_noise(pipe: WanVideoPipeline, track: torch.Tensor) -> torch.Tensor:
+        std = float(getattr(pipe, "track_noise_std", 0.0))
+        if std <= 0.0 or not getattr(pipe.scheduler, "training", False):
+            return track
+        base_min = track.amin()
+        base_max = track.amax()
+        noise = torch.randn_like(track) * std
+        clip_min = torch.minimum(track.new_tensor(pipe.track_clip_min), base_min - 0.05)
+        clip_max = torch.maximum(track.new_tensor(pipe.track_clip_max), base_max + 0.05)
+        return torch.clamp(track + noise, min=clip_min, max=clip_max)
+
+    def process(self, pipe: WanVideoPipeline, action, track, num_frames, input_video=None) -> dict:
         if action is None:
             return {}
         if pipe.action_encoder is None:
             raise ValueError("Action encoder is not available in the pipeline.")
+        if pipe.track_encoder is None:
+            raise ValueError("Track encoder is not available in the pipeline.")
+        if pipe.action_track_fuser is None:
+            raise ValueError("Action-track fuser is not available in the pipeline.")
+        if track is None:
+            raise ValueError("`track` is required when the WAN action branch is enabled.")
+
+        if input_video is not None and int(input_video.shape[0]) != int(pipe.num_track_views):
+            raise ValueError(
+                f"Input video view count {int(input_video.shape[0])} does not match initialized "
+                f"track view count {int(pipe.num_track_views)}."
+            )
 
         pipe.load_models_to_device(self.onload_model_names)
-        # action[B，F,14]
         action = torch.as_tensor(action, device=pipe.device, dtype=pipe.torch_dtype)
+        expected_points = int(pipe.track_num_points_per_view) * int(pipe.num_track_views)
+        track = torch.as_tensor(track, device=pipe.device, dtype=pipe.torch_dtype)
+        track = self._ensure_track_tensor(track, expected_points)
+
+        action = self._fit_sequence_length(action, int(num_frames))
+        track = self._fit_sequence_length(track, int(num_frames))
+        track = self._apply_track_noise(pipe, track)
+        track = rearrange(track, "b t n c -> b t (n c)").contiguous()
 
         if pipe.action_injection_mode == "noise":
-          length = (num_frames - 1) // 4 + 1
-          # action[B，F+3,14]
-          action = torch.concat(
-              [torch.repeat_interleave(action[:, 0:1], repeats=4, dim=1), action[:, 1:]],
-              dim=1,
-          )
-          # action[B，F/4,14]
-          action = action.contiguous().view(action.shape[0], length, 4, action.shape[-1]).mean(dim=2)
-          # action_emb[B，F/4,D_model]
+            action = self._downsample_action_condition(action, int(num_frames))
+            track = self._downsample_track_condition(track, int(num_frames))
 
         if pipe.action_injection_mode == "adaln":
-            # action[B, F*14]
+            action_frame_count = pipe.action_encoder.action_embedding[0].in_features // pipe.action_encoder.action_dim
+            track_frame_count = pipe.track_encoder.action_embedding[0].in_features // pipe.track_encoder.track_dim
+            if action_frame_count != track_frame_count:
+                raise ValueError(
+                    f"Action/track encoder frame mismatch: action={action_frame_count}, track={track_frame_count}"
+                )
+            action = self._fit_sequence_length(action, action_frame_count)
+            track = self._fit_sequence_length(track, track_frame_count)
             action = rearrange(action, "b f d -> b (f d)").contiguous()
-            # action_emb[B, D_model]
-            
+            track = rearrange(track, "b f d -> b (f d)").contiguous()
+
         action_emb = pipe.action_encoder(action)
+        track_emb = pipe.track_encoder(track)
+        action_emb = pipe.action_track_fuser(torch.cat([action_emb, track_emb], dim=-1))
         if pipe.action_injection_mode == "cross":
             action_pos = torch.arange(action_emb.shape[1], device=action_emb.device, dtype=action_emb.dtype)
             action_emb = action_emb + sinusoidal_embedding_1d(action_emb.shape[-1], action_pos).unsqueeze(0)

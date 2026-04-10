@@ -1,7 +1,7 @@
 from typing import Iterable, Optional
 
 from ..core import UnifiedDataset
-from ..core.data.operators import LoadCobotAction, ResolvePromptEmbPath
+from ..core.data.operators import LoadCobotAction, LoadCotrackerTrack, ResolvePromptEmbPath
 from .wan_video_spec import WanRuntimeConfig
 
 
@@ -21,13 +21,24 @@ def build_wan_special_operator_map(
     *,
     base_path: str,
     data_file_keys: Iterable[str],
+    num_frames: int,
+    time_division_factor: int,
+    time_division_remainder: int,
+    track_num_points_per_view: int,
 ) -> dict:
     operator_map = {}
-    if not runtime.enable_text:
-        return operator_map
-    for key in ("prompt_emb", "negative_prompt_emb"):
-        if key in data_file_keys:
-            operator_map[key] = ResolvePromptEmbPath(base_path=base_path)
+    if runtime.enable_text:
+        for key in ("prompt_emb", "negative_prompt_emb"):
+            if key in data_file_keys:
+                operator_map[key] = ResolvePromptEmbPath(base_path=base_path)
+    if "track" in data_file_keys:
+        operator_map["track"] = LoadCotrackerTrack(
+            base_path=base_path,
+            num_frames=num_frames,
+            time_division_factor=time_division_factor,
+            time_division_remainder=time_division_remainder,
+            num_points_per_view=track_num_points_per_view,
+        )
     return operator_map
 
 
@@ -48,6 +59,7 @@ def build_wan_video_dataset(
     sample_indices: Optional[Iterable[int]] = None,
     action_stat_path: Optional[str] = None,
     action_type: Optional[str] = None,
+    track_num_points_per_view: int = 256,
     history_template_sampling: bool | int = False,
     history_anchor_stride: int = 8,
     height_division_factor: int = 16,
@@ -79,6 +91,10 @@ def build_wan_video_dataset(
             runtime,
             base_path=base_path,
             data_file_keys=keys,
+            num_frames=operator_num_frames,
+            time_division_factor=time_division_factor,
+            time_division_remainder=time_division_remainder,
+            track_num_points_per_view=track_num_points_per_view,
         ),
         stat_path=action_stat_path,
         action_type=action_type,
