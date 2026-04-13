@@ -1,6 +1,6 @@
 def debug_on():
     import sys, os
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     sys.argv = [
         "examples/wanvideo/model_training/train.py",
@@ -18,11 +18,19 @@ def debug_on():
         "--learning_rate", "8e-5",
         "--num_epochs", "200",
         "--mixed_precision", "bf16",
-        "--output_path", "Ckpt/wan_atm001B_480_640_202604101603",
+        "--output_path", "Ckpt/wan_atm001B_480_640_202604112252",
         "--gradient_accumulation_steps", "8",
         "--use_swanlab", "1",
         "--swanlab_experiment_name", "temp",
-        "--load_modules", "dit,text:emb,vae,image:off,action:noise",
+        # Old training path: action + track are fused by action_encoder/track_encoder/action_track_fuser
+        # and injected with action:noise. If --trainable_models stays at its default "dit", train.py
+        # expands it to dit,action_encoder,track_encoder,action_track_fuser.
+        # "--load_modules", "dit,text:emb,vae,image:off,action:noise",
+        # "--trainable_models", "dit",
+        # New training path: keep the original action:noise branch and additionally enable the
+        # residual track adapter. Only train track_context_adapter by default for faster adaptation.
+        "--load_modules", "dit,text:emb,vae,image:off,action:noise,track:residual",
+        "--trainable_models", "track_context_adapter",
         "--num_history_frames", "1",
         "--history_template_sampling", "0",
     ]
@@ -206,11 +214,14 @@ if __name__ == "__main__":
     modules = runtime.modules
     data_file_keys = runtime.data_file_keys
     action_enabled = runtime.action_enabled
+    track_enabled = runtime.track_enabled
 
     trainable_models = args.trainable_models
     if not trainable_models:
-        trainable_models = "dit"
-    if action_enabled:
+        trainable_models = "track_context_adapter" if track_enabled else "dit"
+    elif track_enabled and trainable_models == "dit":
+        trainable_models = "track_context_adapter"
+    if action_enabled and not track_enabled:
         models = [m.strip() for m in str(trainable_models).split(",") if m.strip()]
         if all(m == "dit" for m in models):
             models.append("action_encoder")

@@ -3,6 +3,7 @@
 包括：检查点管理、数据加载、视频生成、指标评估
 """
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from atm_support import ATMConditionProvider
 from diffsynth.core import UnifiedDataset
 from diffsynth.pipelines.wan_video import WanVideoPipeline
 from diffsynth.pipelines.wan_video_data import (
@@ -38,6 +40,7 @@ class InferenceSample:
     sample_index: int
     original_video: torch.Tensor
     action: Optional[object]
+    track: Optional[object]
     prompt: Optional[str]
     prompt_emb: Optional[object]
     negative_prompt_emb: Optional[object]
@@ -86,18 +89,18 @@ class InferenceEngine:
         )
         self.dataset: Optional[UnifiedDataset] = None
         self.pipeline: Optional[WanVideoPipeline] = None
+        self.atm_provider: Optional[ATMConditionProvider] = None
         self.sample_indices: List[int] = []
         self.checkpoints: List[Path] = []
         self.total_checkpoint_runs: int = 0
         self.num_views: Optional[int] = None
+        self.track_num_points_per_view: int = int(getattr(config, "track_num_points_per_view", 256) or 256)
         self.generated_sample_records: List[Dict] = []
+        self._loaded_checkpoint: object = object()
 
     def run(self) -> None:
         try:
             self._prepare()
-            with suppress_stdout_if(not self._is_main_process()):
-                self.pipeline = self.pipeline_manager.initialize_pipeline(self.checkpoints)
-
             checkpoints_to_run: List[Optional[Path]] = self.checkpoints if self.checkpoints else [None]
             self.total_checkpoint_runs = len(checkpoints_to_run)
             summaries: List[Dict] = []
@@ -114,13 +117,33 @@ class InferenceEngine:
             raise
 
     def _prepare(self) -> None:
+        self._initialize_atm_provider()
         self._load_dataset()
-        all_sample_indices = list(range(len(self.dataset)))
+        if self.atm_provider is not None:
+            self.atm_provider.validate_dataset_size(len(self.dataset))
+        self.num_views = self._resolve_dataset_num_views()
+        self.track_num_points_per_view = self._resolve_track_num_points_per_view()
+        all_sample_indices = self._resolve_requested_sample_indices(len(self.dataset))
         self.sample_indices = all_sample_indices[self.dist_context.rank :: self.dist_context.world_size]
         self.checkpoints = self.pipeline_manager.discover_checkpoints()
 
         if self._is_main_process():
             self.logger.info("Total samples: %s", len(self.dataset))
+            if all_sample_indices != list(range(len(self.dataset))):
+                self.logger.info("Selected sample count: %s", len(all_sample_indices))
+            if self._requires_track_condition():
+                self.logger.info(
+                    "Track runtime: num_views=%s, track_num_points_per_view=%s",
+                    self.num_views,
+                    self.track_num_points_per_view,
+                )
+            if self.atm_provider is not None:
+                self.logger.info(
+                    "ATM enabled: ckpt=%s | track_steps=%s | track_ids_per_view=%s",
+                    self.config.atm_ckpt_path,
+                    self.atm_provider.num_track_ts,
+                    self.atm_provider.num_track_ids,
+                )
             if self.checkpoints:
                 self.logger.info("Checkpoints to process: %s", len(self.checkpoints))
             else:
@@ -132,6 +155,8 @@ class InferenceEngine:
             self.logger.info("Loading dataset...")
             if "action" in self.config.data_file_keys:
                 self.logger.info("Action stat path: %s", self.config.action_stat_path)
+            if self._use_atm_generated_track():
+                self.logger.info("Track conditioning source: ATM (%s)", self.config.atm_ckpt_path)
 
         with suppress_stdout_if(not self._is_main_process()):
             spatial_division_factor = int(getattr(self.config, "spatial_division_factor", 16))
@@ -146,15 +171,142 @@ class InferenceEngine:
                 repeat=1,
                 resize_mode=self.config.resize_mode,
                 max_pixels=self.config.max_pixels,
-                data_file_keys=self.config.data_file_keys,
+                data_file_keys=self._dataset_data_file_keys(),
                 dataset_num_frames=WAN_INFERENCE_DATASET_NUM_FRAMES,
                 action_stat_path=self.config.action_stat_path,
                 action_type=self.config.action_type,
+                track_num_points_per_view=1 if self._use_atm_generated_track() else self.track_num_points_per_view,
                 history_template_sampling=int(getattr(self.config, "history_template_sampling", 0)),
                 history_anchor_stride=int(getattr(self.config, "history_anchor_stride", 8)),
                 height_division_factor=spatial_division_factor,
                 width_division_factor=spatial_division_factor,
             )
+
+    def _initialize_atm_provider(self) -> None:
+        if not self._use_atm_generated_track():
+            return
+        self.atm_provider = ATMConditionProvider.from_config(
+            self.config,
+            device=self.dist_context.device,
+        )
+
+    def _use_atm_generated_track(self) -> bool:
+        return bool(getattr(self.config, "atm_ckpt_path", None)) and self._requires_track_condition()
+
+    def _requires_track_condition(self) -> bool:
+        return bool(getattr(self.config, "action_enabled", False) or getattr(self.config, "track_enabled", False))
+
+    def _dataset_data_file_keys(self) -> List[str]:
+        keys = [str(key).strip() for key in self.config.data_file_keys if str(key).strip()]
+        if self._use_atm_generated_track():
+            keys = [key for key in keys if key != "track"]
+        return keys
+
+    def _resolve_requested_sample_indices(self, dataset_size: int) -> List[int]:
+        requested = getattr(self.config, "sample_indices", None)
+        if requested in (None, ""):
+            return list(range(int(dataset_size)))
+        if isinstance(requested, str):
+            items = [item.strip() for item in requested.split(",") if item.strip()]
+        elif isinstance(requested, (list, tuple)):
+            items = [str(item).strip() for item in requested if str(item).strip()]
+        else:
+            items = [str(requested).strip()]
+
+        sample_indices: List[int] = []
+        seen = set()
+        for item in items:
+            index = int(item)
+            if index < 0 or index >= int(dataset_size):
+                raise IndexError(f"Sample index out of range: {index} (dataset size: {dataset_size})")
+            if index in seen:
+                continue
+            seen.add(index)
+            sample_indices.append(index)
+        return sample_indices
+
+    def _resolve_dataset_num_views(self) -> int:
+        if self.dataset is None or len(self.dataset) == 0:
+            raise ValueError("Cannot resolve `num_views` from an empty dataset.")
+        sample = self.dataset[0]
+        video = sample["video"]
+        if not isinstance(video, torch.Tensor) or video.ndim != 5:
+            raise TypeError("`sample['video']` must be torch.Tensor with shape (V,C,T,H,W).")
+        resolved_num_views = int(video.shape[0])
+        explicit_num_views = getattr(self.config, "track_num_views", None)
+        if explicit_num_views not in (None, "", 0) and int(explicit_num_views) != resolved_num_views:
+            self.logger.warning(
+                "Ignoring explicit track_num_views=%s because dataset samples use %s views.",
+                explicit_num_views,
+                resolved_num_views,
+            )
+        return resolved_num_views
+
+    def _resolve_track_num_points_per_view(self) -> int:
+        if not self._requires_track_condition():
+            return int(getattr(self.config, "track_num_points_per_view", 256) or 256)
+        if self.atm_provider is not None:
+            return self.atm_provider.num_track_ids
+        if self.dataset is None or len(self.dataset) == 0:
+            raise ValueError("Cannot resolve `track_num_points_per_view` from an empty dataset.")
+        sample = self.dataset[0]
+        track = sample.get("track")
+        if track is None:
+            return int(getattr(self.config, "track_num_points_per_view", 256) or 256)
+        return self._infer_track_num_points_per_view(track, self._resolve_num_views())
+
+    @staticmethod
+    def _infer_track_num_points_per_view(track, num_views: int) -> int:
+        if not hasattr(track, "shape") or len(track.shape) < 3:
+            raise TypeError(f"Unexpected track payload for inference: {type(track)}")
+        total_points = int(track.shape[2])
+        if total_points <= 0:
+            raise ValueError("Track conditioning has no points.")
+        if total_points % int(num_views) != 0:
+            raise ValueError(
+                f"Track points {total_points} are not divisible by num_views={num_views}."
+            )
+        return total_points // int(num_views)
+
+    def _resolve_sample_track(self, sample_idx: int, sample: Dict):
+        if not self._requires_track_condition():
+            return None
+        if self.atm_provider is not None:
+            return None
+        track = sample.get("track")
+        if track is None:
+            raise ValueError(
+                "Track conditioning is required by the selected WAN modules, but no track source is available."
+            )
+        if isinstance(track, torch.Tensor):
+            return track.detach().cpu()
+        return track
+
+    def _resolve_prompt_inputs(self, sample: Dict) -> tuple[str, Optional[object], Optional[object]]:
+        prompt = str(sample.get("prompt") or "")
+        prompt_emb = sample.get("prompt_emb")
+        if prompt_emb:
+            prompt_emb = resolve_optional_path(prompt_emb, self.config.dataset_base_path)
+
+        negative_prompt_emb = sample.get("negative_prompt_emb") or self.config.negative_prompt_emb
+        negative_prompt_emb = resolve_optional_path(negative_prompt_emb, self.config.dataset_base_path)
+
+        if self.config.text_mode == "emb":
+            if not prompt_emb or not os.path.isfile(prompt_emb):
+                raise FileNotFoundError(
+                    f"Missing `prompt_emb` for sample when WAN text mode is `emb`: {prompt_emb}"
+                )
+            if not negative_prompt_emb or not os.path.isfile(negative_prompt_emb):
+                raise FileNotFoundError(
+                    f"Missing `negative_prompt_emb` for WAN text mode `emb`: {negative_prompt_emb}"
+                )
+        else:
+            if prompt_emb and not os.path.isfile(prompt_emb):
+                prompt_emb = None
+            if negative_prompt_emb and not os.path.isfile(negative_prompt_emb):
+                negative_prompt_emb = None
+
+        return prompt, prompt_emb, negative_prompt_emb
 
     def _process_checkpoint(
         self,
@@ -173,11 +325,9 @@ class InferenceEngine:
             )
             self.logger.info("%s\n", "#" * 80)
 
-        with suppress_stdout_if(not self._is_main_process()):
-            self.pipeline_manager.update_checkpoint(checkpoint)
         output_dirs = self._create_output_dirs(checkpoint)
         self.generated_sample_records = []
-        self._generate_all_videos(output_dirs, ckpt_idx)
+        self._generate_all_videos(output_dirs, ckpt_idx, checkpoint=checkpoint)
         self._write_rank_sample_records(output_dirs["root"])
         barrier(self.dist_context)
         merged_sample_records = self._merge_sample_records(output_dirs["root"])
@@ -201,16 +351,33 @@ class InferenceEngine:
         from datetime import datetime
 
         output_dir_value = None
+        explicit_output_dir = getattr(self.config, "output_dir", None)
+        resume_enabled = bool(getattr(self.config, "resume", False))
         if self.dist_context.is_main_process:
-            timestamp = datetime.now().strftime("%mM%dD_%HH%MMin")
-            if checkpoint is None:
-                output_dir_value = str(Path("Ckpt") / "pretrained" / timestamp)
+            if explicit_output_dir:
+                output_dir_value = str(Path(explicit_output_dir))
             else:
-                output_dir_value = str(checkpoint.parent / checkpoint.stem / timestamp)
+                timestamp = datetime.now().strftime("%mM%dD_%HH%MMin")
+                if checkpoint is None:
+                    output_dir_value = str(Path("Ckpt") / "pretrained" / timestamp)
+                else:
+                    output_dir_value = str(checkpoint.parent / checkpoint.stem / timestamp)
         output_dir = Path(broadcast_object(self.dist_context, output_dir_value))
+        if resume_enabled and not output_dir.exists():
+            raise FileNotFoundError(f"`--resume` expects an existing output directory, got: {output_dir}")
+        output_dir_preexisted = output_dir.exists()
         output_dir.mkdir(parents=True, exist_ok=True)
         if self.dist_context.is_main_process:
-            self._save_config(output_dir)
+            if explicit_output_dir:
+                if resume_enabled:
+                    self.logger.info("Resume enabled; reusing output directory: %s", output_dir.resolve())
+                else:
+                    self.logger.info("Using explicit output directory: %s", output_dir.resolve())
+            config_path = output_dir / "config.json"
+            if not output_dir_preexisted or not config_path.is_file():
+                self._save_config(output_dir)
+            elif explicit_output_dir:
+                self.logger.info("Keeping existing config: %s", config_path.resolve())
         barrier(self.dist_context)
         if self._is_main_process():
             self.logger.info("Output directory: %s\n", output_dir.resolve())
@@ -239,6 +406,13 @@ class InferenceEngine:
         metrics_path = output_dirs["root"] / "metrics.json"
         self.logger.info("Metrics are evaluated on rank 0 only.")
         self.logger.info("Evaluating metrics for checkpoint: %s", checkpoint_name)
+        self.logger.info("Metric preset: %s", self.config.metric_preset)
+        self.logger.info(
+            "Metric runtime: streaming_eval=%s | eval_video_batch_size=%s | eval_num_workers=%s",
+            bool(getattr(self.config, "streaming_eval", 1)),
+            int(getattr(self.config, "eval_video_batch_size", 1)),
+            int(getattr(self.config, "eval_num_workers", 8)),
+        )
         metrics = evaluate_and_write_report(
             str(output_dirs["root"]),
             checkpoint_name=checkpoint_name,
@@ -246,12 +420,36 @@ class InferenceEngine:
             sample_records=sample_records,
             num_views=self._resolve_num_views(),
             frame_chunk_size=int(self.config.num_frames),
+            metric_preset=self.config.metric_preset,
+            streaming_eval=bool(getattr(self.config, "streaming_eval", 1)),
+            eval_video_batch_size=int(getattr(self.config, "eval_video_batch_size", 1)),
+            eval_num_workers=int(getattr(self.config, "eval_num_workers", 8)),
         )
         self.logger.info("Saved metrics to: %s", metrics_path.resolve())
         self.logger.info("%s\n", metrics["overall"])
         return metrics
 
-    def _generate_all_videos(self, output_dirs: Dict[str, Path], ckpt_idx: int) -> None:
+    def _ensure_pipeline_for_checkpoint(self, checkpoint: Optional[Path]) -> None:
+        if self.pipeline is None:
+            with suppress_stdout_if(not self._is_main_process()):
+                self.pipeline = self.pipeline_manager.initialize_pipeline(
+                    self.checkpoints,
+                    num_track_views=self._resolve_num_views(),
+                    track_num_points_per_view=self.track_num_points_per_view,
+                )
+        if self._loaded_checkpoint == checkpoint:
+            return
+        with suppress_stdout_if(not self._is_main_process()):
+            self.pipeline_manager.update_checkpoint(checkpoint)
+        self._loaded_checkpoint = checkpoint
+
+    def _generate_all_videos(
+        self,
+        output_dirs: Dict[str, Path],
+        ckpt_idx: int,
+        *,
+        checkpoint: Optional[Path],
+    ) -> None:
         for index, sample_idx in enumerate(self.sample_indices, 1):
             if self._is_main_process():
                 self.logger.info("\n%s", "#" * 60)
@@ -270,7 +468,40 @@ class InferenceEngine:
 
             raw_sample = self.dataset[sample_idx]
             sample = self._prepare_sample(sample_idx, raw_sample)
+            if self._maybe_reuse_existing_video(sample, output_dirs):
+                continue
+            self._ensure_pipeline_for_checkpoint(checkpoint)
             self._generate_single_video(sample, output_dirs)
+
+    def _resolve_sample_video_path(
+        self,
+        sample: InferenceSample,
+        output_dirs: Dict[str, Path],
+    ) -> Path:
+        type_dir = output_dirs["root"] / sample.sample_type
+        video_name = f"video_s{sample.sample_index:06d}_ep{sample.episode_index}.mp4"
+        return type_dir / video_name
+
+    def _maybe_reuse_existing_video(
+        self,
+        sample: InferenceSample,
+        output_dirs: Dict[str, Path],
+    ) -> bool:
+        if not bool(getattr(self.config, "resume", False)):
+            return False
+        existing_video_path = self._resolve_sample_video_path(sample, output_dirs)
+        if not existing_video_path.is_file():
+            return False
+        self._record_generated_sample(
+            video_path=existing_video_path,
+            prompt=sample.prompt,
+            sample_type=sample.sample_type,
+            episode_index=sample.episode_index,
+            sample_index=sample.sample_index,
+        )
+        if self._is_main_process():
+            self.logger.info("Reusing existing video: %s\n", existing_video_path.resolve())
+        return True
 
     def _prepare_sample(self, sample_idx: int, sample: Dict) -> InferenceSample:
         original_video = sample["video"]
@@ -280,13 +511,16 @@ class InferenceEngine:
             )
         original_video = original_video.detach().cpu()
         action = sample.get("action")
-        if getattr(self.pipeline, "action_injection_mode", "off") == "off":
+        track = self._resolve_sample_track(sample_idx, sample)
+        if getattr(self.config, "action_mode", "off") == "off":
             action = None
+        if (
+            getattr(self.config, "action_mode", "off") == "off"
+            and getattr(self.config, "track_mode", "off") == "off"
+        ):
+            track = None
         episode_index = int(sample["episode_index"])
-        prompt = sample.get("prompt")
-        prompt_emb = resolve_optional_path(sample.get("prompt_emb"), self.config.dataset_base_path)
-        negative_prompt_emb = sample.get("negative_prompt_emb", self.config.negative_prompt_emb)
-        negative_prompt_emb = resolve_optional_path(negative_prompt_emb, self.config.dataset_base_path)
+        prompt, prompt_emb, negative_prompt_emb = self._resolve_prompt_inputs(sample)
         sample_type = str(sample.get("type") or "unknown")
 
         num_views = int(original_video.shape[0])
@@ -302,6 +536,7 @@ class InferenceEngine:
             sample_index=int(sample_idx),
             original_video=original_video,
             action=action,
+            track=track,
             prompt=prompt,
             prompt_emb=prompt_emb,
             negative_prompt_emb=negative_prompt_emb,
@@ -322,14 +557,14 @@ class InferenceEngine:
         predicted_video = self._predict_video(sample)
         predicted_video = self._finalize_predicted_video(predicted_video, sample.original_video)
 
-        type_dir = output_dirs["root"] / sample.sample_type
+        output_path = self._resolve_sample_video_path(sample, output_dirs)
+        type_dir = output_path.parent
         type_dir.mkdir(parents=True, exist_ok=True)
-        video_name = f"video_s{sample.sample_index:06d}_ep{sample.episode_index}.mp4"
         saved_path = self.video_saver.save_comparison(
             sample.original_video[:, :, : int(predicted_video.shape[2])],
             predicted_video,
             type_dir,
-            video_name,
+            output_path.name,
         )
         self._record_generated_sample(
             video_path=saved_path,
@@ -349,6 +584,51 @@ class InferenceEngine:
         self.logger.info("Type: %s", sample.sample_type)
         self.logger.info("Generating with diffusion (frames: %s)", sample.total_frames)
         self.logger.info("Using input size: %sx%s", sample.input_width, sample.input_height)
+        self.logger.info(
+            "Condition shapes: action=%s | track=%s",
+            None if sample.action is None else tuple(sample.action.shape),
+            "ATM(dynamic)"
+            if sample.track is None and self.atm_provider is not None and self._requires_track_condition()
+            else (None if sample.track is None else tuple(sample.track.shape)),
+        )
+
+    def _resolve_track_condition(
+        self,
+        sample: InferenceSample,
+        *,
+        input_video: torch.Tensor,
+        start: int,
+        target_frames: int,
+        infer_frames: int,
+    ):
+        if not self._requires_track_condition():
+            return None
+        if self.atm_provider is not None:
+            if int(target_frames) > int(self.atm_provider.num_track_ts) or int(infer_frames) > int(self.atm_provider.num_track_ts):
+                raise ValueError(
+                    "ATM-conditioned inference requires chunked windows no longer than "
+                    f"{self.atm_provider.num_track_ts} frames, got target={target_frames}, infer={infer_frames}. "
+                    "Enable `--chunk_infer 1` for whole-video validation."
+                )
+            track = self.atm_provider.track_for_window(
+                sample.sample_index,
+                input_video=input_video,
+                start_frame_offset=int(start),
+            )
+            return self._slice_and_pad_condition(
+                condition=track,
+                start=0,
+                target_frames=target_frames,
+                infer_frames=infer_frames,
+            )
+
+        track = self._trim_condition(sample.track, sample.total_frames)
+        return self._slice_and_pad_condition(
+            condition=track,
+            start=start,
+            target_frames=target_frames,
+            infer_frames=infer_frames,
+        )
 
     def _predict_video(self, sample: InferenceSample) -> torch.Tensor:
         if self.config.chunk_infer and sample.total_frames > int(self.config.num_frames):
@@ -357,18 +637,27 @@ class InferenceEngine:
 
     def _run_single_pass_inference(self, sample: InferenceSample) -> torch.Tensor:
         history_frames = int(self.config.num_history_frames)
-        action = self._trim_action(sample.action, sample.total_frames)
+        action = self._trim_condition(sample.action, sample.total_frames)
         infer_frames = self._align_num_frames(sample.total_frames)
-        infer_action = self._slice_and_pad_action(
-            action=action,
+        infer_action = self._slice_and_pad_condition(
+            condition=action,
+            start=0,
+            target_frames=sample.total_frames,
+            infer_frames=infer_frames,
+        )
+        input_video = sample.original_video[:, :, :history_frames]
+        infer_track = self._resolve_track_condition(
+            sample,
+            input_video=input_video,
             start=0,
             target_frames=sample.total_frames,
             infer_frames=infer_frames,
         )
         predicted_video = self._call_pipeline(
             sample,
-            input_video=sample.original_video[:, :, :history_frames],
+            input_video=input_video,
             action=infer_action,
+            track=infer_track,
             infer_frames=infer_frames,
         )
         predicted_video = predicted_video.detach().cpu()[:, :, :sample.total_frames]
@@ -383,9 +672,9 @@ class InferenceEngine:
                 f"Chunked inference requires num_frames > num_history_frames, got {chunk_size} and {history_frames}"
             )
 
-        action = self._trim_action(sample.action, sample.total_frames)
+        action = self._trim_condition(sample.action, sample.total_frames)
         chunk_starts = [0]
-        while chunk_starts[-1] + chunk_stride + chunk_size <= sample.total_frames:
+        while chunk_starts[-1] + chunk_stride < sample.total_frames:
             chunk_starts.append(chunk_starts[-1] + chunk_stride)
 
         predicted_chunks: List[torch.Tensor] = []
@@ -393,17 +682,25 @@ class InferenceEngine:
         for chunk_idx, start in enumerate(chunk_starts):
             chunk_frames = min(chunk_size, sample.total_frames - start)
             infer_frames = self._align_num_frames(chunk_frames)
-            chunk_action = self._slice_and_pad_action(
-                action=action,
+            chunk_action = self._slice_and_pad_condition(
+                condition=action,
                 start=start,
                 target_frames=chunk_frames,
                 infer_frames=infer_frames,
             )
             chunk_input_video = last_input_video
+            chunk_track = self._resolve_track_condition(
+                sample,
+                input_video=chunk_input_video,
+                start=start,
+                target_frames=chunk_frames,
+                infer_frames=infer_frames,
+            )
             chunk_video = self._call_pipeline(
                 sample,
                 input_video=chunk_input_video,
                 action=chunk_action,
+                track=chunk_track,
                 infer_frames=infer_frames,
             )
             chunk_video = chunk_video.detach().cpu()[:, :, :chunk_frames]
@@ -425,6 +722,7 @@ class InferenceEngine:
         *,
         input_video: torch.Tensor,
         action,
+        track,
         infer_frames: int,
     ) -> torch.Tensor:
         predicted_video = self.pipeline(
@@ -434,6 +732,7 @@ class InferenceEngine:
             negative_prompt_emb=sample.negative_prompt_emb,
             input_video=input_video,
             action=action,
+            track=track,
             seed=self.config.seed,
             tiled=False,
             height=sample.input_height,
@@ -442,6 +741,7 @@ class InferenceEngine:
             num_history_frames=int(self.config.num_history_frames),
             cfg_scale=self.config.cfg_scale,
             num_inference_steps=self.config.num_inference_steps,
+            sigma_shift=self.config.sigma_shift,
             progress_bar_cmd=self._progress_bar_cmd(),
         )
         if not isinstance(predicted_video, torch.Tensor) or predicted_video.ndim != 5:
@@ -525,21 +825,21 @@ class InferenceEngine:
         return num_frames + (4 - ((num_frames - 1) % 4))
 
     @staticmethod
-    def _slice_and_pad_action(action, start: int, target_frames: int, infer_frames: int):
-        if action is None:
+    def _slice_and_pad_condition(condition, start: int, target_frames: int, infer_frames: int):
+        if condition is None:
             return None
-        chunk_action = action[:, start : start + target_frames]
-        current_frames = int(chunk_action.shape[1])
+        chunk_condition = condition[:, start : start + target_frames]
+        current_frames = int(chunk_condition.shape[1])
         if current_frames >= infer_frames:
-            return chunk_action[:, :infer_frames]
+            return chunk_condition[:, :infer_frames]
         if current_frames <= 0:
-            return chunk_action
+            return chunk_condition
         pad_frames = infer_frames - current_frames
-        if isinstance(chunk_action, torch.Tensor):
-            pad = chunk_action[:, -1:, :].repeat(1, pad_frames, 1)
-            return torch.cat([chunk_action, pad], dim=1)
-        pad = np.repeat(chunk_action[:, -1:, :], repeats=pad_frames, axis=1)
-        return np.concatenate([chunk_action, pad], axis=1)
+        if isinstance(chunk_condition, torch.Tensor):
+            pad = chunk_condition[:, -1:, ...].repeat(1, pad_frames, *([1] * (chunk_condition.ndim - 2)))
+            return torch.cat([chunk_condition, pad], dim=1)
+        pad = np.repeat(chunk_condition[:, -1:, ...], repeats=pad_frames, axis=1)
+        return np.concatenate([chunk_condition, pad], axis=1)
 
     @staticmethod
     def _restore_history_frames(
@@ -557,7 +857,7 @@ class InferenceEngine:
         return predicted_video
 
     @staticmethod
-    def _trim_action(action, total_frames: int):
-        if action is None:
+    def _trim_condition(condition, total_frames: int):
+        if condition is None:
             return None
-        return action[:, :total_frames]
+        return condition[:, :total_frames]

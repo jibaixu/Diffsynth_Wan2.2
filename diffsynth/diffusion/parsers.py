@@ -62,7 +62,7 @@ def add_video_size_config(parser: argparse.ArgumentParser):
 def add_model_config(parser: argparse.ArgumentParser):
     group = _get_group(parser, "model")
     group.add_argument("--model_paths", type=str, default=None, help="Root path of the WAN pretrained weights.")
-    group.add_argument("--load_modules", type=str, default=None, help="Comma-separated modules to load: dit,text,vae,image,action. Supported variants: action:noise|adaln|cross|off, text:t5|emb|off, and image:flat|off. You can also set the default via env LOAD_MODULES.")
+    group.add_argument("--load_modules", type=str, default=None, help="Comma-separated modules to load: dit,text,vae,image,action,track. Supported variants: action:noise|adaln|cross|off, track:residual|off, text:t5|emb|off, and image:flat|off. You can also set the default via env LOAD_MODULES.")
     group.add_argument("--model_id_with_origin_paths", type=str, default=None, help="Model ID with origin paths, e.g., Wan-AI/Wan2.1-T2V-1.3B:diffusion_pytorch_model*.safetensors. Comma-separated.")
     group.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     group.add_argument("--extra_inputs", default="input_image", help="Additional model inputs, comma-separated.")
@@ -75,7 +75,7 @@ def add_training_config(parser: argparse.ArgumentParser):
     group.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate.")
     group.add_argument("--seed", type=int, default=42, help="Random seed for python/numpy/torch.")
     group.add_argument("--num_epochs", type=int, default=1, help="Number of epochs.")
-    group.add_argument("--trainable_models", type=str, default="dit", help="Models to train, e.g., dit, vae, text_encoder.")
+    group.add_argument("--trainable_models", type=str, default="dit", help="Models to train, e.g., dit, vae, text_encoder, track_context_adapter.")
     group.add_argument("--find_unused_parameters", default=False, action="store_true", help="Whether to find unused parameters in DDP.")
     group.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     group.add_argument("--task", type=str, default="sft", required=False, help="Task type.")
@@ -129,14 +129,21 @@ def add_action_config(parser: argparse.ArgumentParser):
 
 def add_infer_config(parser: argparse.ArgumentParser):
     group = _get_group(parser, "infer")
-    group.add_argument("--ckpt_path", dest="checkpoint_path", type=str, default=None, help=("Path to checkpoint file or directory (optional; merged onto pretrained WAN weights). " "Supports checkpoints that include dit/action_encoder keys."))
+    group.add_argument("--ckpt_path", dest="checkpoint_path", type=str, default=None, help=("Path to checkpoint file or directory (optional; merged onto pretrained WAN weights). " "Supports checkpoints that include dit/action_encoder/track_context_adapter keys."))
+    group.add_argument("--atm_ckpt_path", type=str, default=None, help="Optional ATM checkpoint used to generate multiview track conditioning during inference.")
     group.add_argument("--cfg_scale", type=float, default=5.0, help="CFG scale for generation")
     group.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps.")
+    group.add_argument("--sigma_shift", type=float, default=5.0, help="Sigma shift for WAN scheduler inference.")
     group.add_argument("--negative_prompt", type=str, default=("The video is not of a high quality, it has a low resolution. Watermark present in each frame. The background is solid. Strange body and strange trajectory. Distortion"), help="Negative prompt for generation")
-    group.add_argument("--negative_prompt_emb", type=str, default=None, help="Path to the pre-extracted negative prompt embedding.")
+    group.add_argument("--negative_prompt_emb", type=str, default="prompt_emb/neg_prompt.pt", help="Path to the pre-extracted negative prompt embedding.")
     group.add_argument("--quality", type=int, default=5, help="Output video quality.")
     group.add_argument("--metrics", dest="enable_metrics", type=int, default=1, choices=[0, 1], help="Enable (1) or disable (0) evaluation metrics")
+    group.add_argument("--metric_preset", type=str, default="core", choices=["core", "all"], help="Metric preset: core runs psnr/ssim/mse/lpips/fid/fvd only; all also runs PBench.")
+    group.add_argument("--streaming_eval", type=int, default=1, choices=[0, 1], help="Enable streaming metric evaluation to avoid caching all decoded comparison videos in RAM.")
+    group.add_argument("--eval_video_batch_size", type=int, default=1, help="Number of comparison videos to decode per batch during metric evaluation.")
+    group.add_argument("--eval_num_workers", type=int, default=8, help="Worker threads for PSNR/SSIM/MSE during metric evaluation.")
     group.add_argument("--chunk_infer", type=int, default=1, choices=[0, 1], help="Enable chunked inference with 81-frame segments (0=off, 1=on).")
+    group.add_argument("--sample_indices", type=str, default=None, help="Optional comma-separated sample indices for debugging or partial evaluation.")
     group.add_argument("--fps", type=int, default=30, help="Output video FPS")
     return parser
 

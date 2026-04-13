@@ -12,6 +12,7 @@ from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 
 from ..models.wan_video_dit import WanModel, sinusoidal_embedding_1d
 from ..models.wan_video_action_encoder import WanVideoActionEncoder
+from ..models.wan_video_track_adapter import WanTrackResidualAdapter
 from ..models.wan_video_track_encoder import WanVideoActionTrackFuser, WanVideoTrackEncoder
 from ..models.wan_video_text_encoder import WanTextEncoder, HuggingfaceTokenizer
 from ..models.wan_video_vae import WanVideoVAE
@@ -39,6 +40,7 @@ class WanVideoPipeline(BasePipeline):
         self.enable_text_encoder = self.module_spec.enable_text_encoder
         self.clip_mode = self.module_spec.clip_mode
         self.action_injection_mode = self.module_spec.action_mode
+        self.track_injection_mode = self.module_spec.track_mode
         self.tokenizer: HuggingfaceTokenizer = None
         self.text_encoder: WanTextEncoder = None
         self.image_encoder: WanImageEncoder = None
@@ -46,6 +48,7 @@ class WanVideoPipeline(BasePipeline):
         self.action_encoder: WanVideoActionEncoder = None
         self.track_encoder: WanVideoTrackEncoder = None
         self.action_track_fuser: WanVideoActionTrackFuser = None
+        self.track_context_adapter: WanTrackResidualAdapter = None
         self.vae: WanVideoVAE = None
         self.num_track_views = 1
         self.track_num_points_per_view = 256
@@ -65,6 +68,8 @@ class WanVideoPipeline(BasePipeline):
             self.units.append(WanVideoUnit_PromptEmbedder())
         if self.action_injection_mode != "off":
             self.units.append(WanVideoUnit_ActionEmbedder())
+        if self.track_injection_mode != "off":
+            self.units.append(WanVideoUnit_TrackContextEmbedder())
 
 
     def model_fn(self, *args, **kwargs):
@@ -87,6 +92,7 @@ class WanVideoPipeline(BasePipeline):
         module_spec = WanModuleSpec.parse(modules)
         modules = list(module_spec.modules)
         action_enabled = module_spec.action_enabled
+        track_enabled = module_spec.track_enabled
 
         # Redirect model path
         if redirect_common_files:
@@ -132,6 +138,7 @@ class WanVideoPipeline(BasePipeline):
         pipe.action_encoder = model_pool.fetch_model("wan_video_action_encoder") if action_enabled else None
         pipe.track_encoder = model_pool.fetch_model("wan_video_track_encoder") if action_enabled else None
         pipe.action_track_fuser = model_pool.fetch_model("wan_video_action_track_fuser") if action_enabled else None
+        pipe.track_context_adapter = model_pool.fetch_model("wan_video_track_residual_adapter") if track_enabled else None
 
         if action_enabled:
             action_dim = 14
@@ -165,6 +172,22 @@ class WanVideoPipeline(BasePipeline):
             pipe.action_encoder = pipe.action_encoder.to(dtype=pipe.torch_dtype, device=pipe.device)
             pipe.track_encoder = pipe.track_encoder.to(dtype=pipe.torch_dtype, device=pipe.device)
             pipe.action_track_fuser = pipe.action_track_fuser.to(dtype=pipe.torch_dtype, device=pipe.device)
+
+        if track_enabled:
+            dim = getattr(pipe.dit, "dim", 1536) if pipe.dit is not None else 1536
+            patch_size = tuple(getattr(pipe.dit, "patch_size", (1, 2, 2))) if pipe.dit is not None else (1, 2, 2)
+            injection_start = len(getattr(pipe.dit, "blocks", [])) // 2
+            num_injection_layers = len(getattr(pipe.dit, "blocks", [])) - injection_start
+            hidden_dim = min(512, max(128, dim // 4))
+            if pipe.track_context_adapter is None:
+                pipe.track_context_adapter = WanTrackResidualAdapter(
+                    track_in_dim=4,
+                    hidden_dim=hidden_dim,
+                    out_dim=dim,
+                    patch_size=patch_size,
+                    num_layers=max(1, num_injection_layers),
+                )
+            pipe.track_context_adapter = pipe.track_context_adapter.to(dtype=pipe.torch_dtype, device=pipe.device)
 
         # Size division factor
         if pipe.vae is not None:
@@ -558,6 +581,134 @@ class WanVideoUnit_ActionEmbedder(PipelineUnit): # infer & train
         return {"action_emb": action_emb}
 
 
+class WanVideoUnit_TrackContextEmbedder(PipelineUnit):
+    def __init__(self):
+        super().__init__(
+            input_params=("track", "num_frames", "height", "width", "input_video"),
+            output_params=("track_residuals",),
+            onload_model_names=("track_context_adapter",),
+        )
+
+    @staticmethod
+    def _normalize_track_coordinates(track: torch.Tensor, width: int, height: int) -> torch.Tensor:
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid frame size for track normalization: height={height}, width={width}")
+
+        track = track.clone()
+        max_coordinate = float(track.detach().abs().amax().item()) if track.numel() > 0 else 0.0
+        if max_coordinate > 2.0:
+            track[..., 0] = track[..., 0] / max(float(width - 1), 1.0)
+            track[..., 1] = track[..., 1] / max(float(height - 1), 1.0)
+        return track
+
+    @staticmethod
+    def _build_track_feature_map(track: torch.Tensor, latent_height: int, latent_width: int) -> torch.Tensor:
+        if latent_height <= 0 or latent_width <= 0:
+            raise ValueError(
+                f"Track feature map requires positive latent shape, got height={latent_height}, width={latent_width}"
+            )
+
+        batch_size, num_frames, num_views, points_per_view, _ = track.shape
+        flattened = rearrange(track, "b t v p c -> (b t v) p c").contiguous()
+        map_count = flattened.shape[0]
+        device = flattened.device
+        dtype = flattened.dtype
+
+        x = flattened[..., 0].clamp(0.0, 1.0) * max(latent_width - 1, 0)
+        y = flattened[..., 1].clamp(0.0, 1.0) * max(latent_height - 1, 0)
+        x0 = torch.floor(x).long().clamp(0, latent_width - 1)
+        y0 = torch.floor(y).long().clamp(0, latent_height - 1)
+        x1 = (x0 + 1).clamp(0, latent_width - 1)
+        y1 = (y0 + 1).clamp(0, latent_height - 1)
+        dx = x - x0.to(dtype=dtype)
+        dy = y - y0.to(dtype=dtype)
+
+        weight00 = (1 - dx) * (1 - dy)
+        weight01 = (1 - dx) * dy
+        weight10 = dx * (1 - dy)
+        weight11 = dx * dy
+
+        feature_sums = torch.zeros(map_count, 3, latent_height * latent_width, dtype=dtype, device=device)
+
+        def splat(x_index: torch.Tensor, y_index: torch.Tensor, weight: torch.Tensor) -> None:
+            flat_index = (y_index * latent_width + x_index).view(map_count, points_per_view)
+            weight = weight.view(map_count, points_per_view)
+            feature_sums[:, 0].scatter_add_(1, flat_index, (x.view(map_count, points_per_view) * weight))
+            feature_sums[:, 1].scatter_add_(1, flat_index, (y.view(map_count, points_per_view) * weight))
+            feature_sums[:, 2].scatter_add_(1, flat_index, weight)
+
+        splat(x0, y0, weight00)
+        splat(x0, y1, weight01)
+        splat(x1, y0, weight10)
+        splat(x1, y1, weight11)
+
+        count = feature_sums[:, 2]
+        mask = (count > 0).to(dtype=dtype)
+        avg_x = torch.where(count > 0, feature_sums[:, 0] / count.clamp_min(1e-6), torch.zeros_like(count))
+        avg_y = torch.where(count > 0, feature_sums[:, 1] / count.clamp_min(1e-6), torch.zeros_like(count))
+        avg_x = avg_x / max(latent_width - 1, 1)
+        avg_y = avg_y / max(latent_height - 1, 1)
+        density = (count / max(points_per_view, 1)).clamp(max=1.0)
+        feature_map = torch.stack([avg_x * mask, avg_y * mask, density, mask], dim=1)
+        feature_map = feature_map.view(map_count, 4, latent_height, latent_width)
+        feature_map = feature_map.view(batch_size, num_frames, num_views, 4, latent_height, latent_width)
+        return rearrange(feature_map, "b t v c h w -> b c t (v h) w").contiguous()
+
+    def process(self, pipe: WanVideoPipeline, track, num_frames, height, width, input_video=None) -> dict:
+        if track is None:
+            raise ValueError("`track` is required when the WAN track residual adapter is enabled.")
+        if pipe.track_context_adapter is None:
+            raise ValueError("Track context adapter is not available in the pipeline.")
+        if pipe.vae is None:
+            raise ValueError("VAE is required to derive the track feature-map resolution.")
+
+        if input_video is not None and int(input_video.shape[0]) != int(pipe.num_track_views):
+            raise ValueError(
+                f"Input video view count {int(input_video.shape[0])} does not match initialized "
+                f"track view count {int(pipe.num_track_views)}."
+            )
+
+        pipe.load_models_to_device(self.onload_model_names)
+        expected_points = int(pipe.track_num_points_per_view) * int(pipe.num_track_views)
+        track = torch.as_tensor(track, device=pipe.device, dtype=pipe.torch_dtype)
+        track = WanVideoUnit_ActionEmbedder._ensure_track_tensor(track, expected_points)
+        track = WanVideoUnit_ActionEmbedder._fit_sequence_length(track, int(num_frames))
+        track = WanVideoUnit_ActionEmbedder._apply_track_noise(pipe, track)
+        # Residual track features must share the VAE latent timeline with DiT tokens.
+        track = rearrange(track, "b t n c -> b t (n c)").contiguous()
+        track = WanVideoUnit_ActionEmbedder._downsample_track_condition(track, int(num_frames))
+        track = rearrange(track, "b t (n c) -> b t n c", c=2).contiguous()
+
+        points_per_view = int(pipe.track_num_points_per_view)
+        num_views = int(pipe.num_track_views)
+        track = rearrange(track, "b t (v p) c -> b t v p c", v=num_views, p=points_per_view).contiguous()
+        track = self._normalize_track_coordinates(track, int(width), int(height))
+
+        latent_height = int(height) // pipe.vae.upsampling_factor
+        latent_width = int(width) // pipe.vae.upsampling_factor
+        track_feature_map = self._build_track_feature_map(track, latent_height, latent_width)
+        track_residuals = pipe.track_context_adapter(track_feature_map)
+        return {"track_residuals": track_residuals}
+
+
+def _validate_track_residual_shape(
+    track_delta: torch.Tensor,
+    x: torch.Tensor,
+    block_id: int,
+    residual_id: int,
+    grid_size: tuple[int, int, int],
+) -> None:
+    if track_delta.shape == x.shape:
+        return
+    f, h, w = (int(size) for size in grid_size)
+    raise ValueError(
+        "Track residual token shape mismatch at "
+        f"DiT block {block_id}: residual[{residual_id}] has shape {tuple(track_delta.shape)} "
+        f"but x has shape {tuple(x.shape)}. Expected latent token grid ({f}, {h}, {w}) "
+        f"with {f * h * w} tokens."
+    )
+
+
 class WanVideoUnit_ImageEmbedderCLIP(PipelineUnit): #infer & train
     """
     CLIP 图像编码器单元
@@ -691,6 +842,7 @@ def model_fn_wan_video(
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
     action_emb: Optional[torch.Tensor] = None,
+    track_residuals: Optional[list[torch.Tensor]] = None,
     action_injection_mode: str = "off",
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
@@ -704,6 +856,7 @@ def model_fn_wan_video(
     - timestep: 当前扩散时间步 (0~1000)
     - context: (B=1, L_word=512, D_text=4096) - 文本s嵌入
     - action_emb: (B=1, F, D_model) or (B=1, F/4, D_model) or (B=1, D_model) - action 嵌入 (可选)
+    - track_residuals: 后半段 DiT block 的逐层 residual 注入 (可选)
     - clip_feature: (B=1, N_token=257, D_clip=1280) - CLIP 图像特征 (可选)
     - y: (B=1, C=4[mask]+16[vae]=20, F/4, H/8, W/8) - mask+VAE 编码的首帧 (可选)
     - use_gradient_checkpointing: 是否使用梯度检查点 (节省显存)
@@ -807,8 +960,22 @@ def model_fn_wan_video(
             return module(*inputs)
         return custom_forward
 
-    for block in dit.blocks:
+    if track_residuals is None:
+        track_residuals = []
+    if len(track_residuals) > len(dit.blocks):
+        raise ValueError(
+            f"Too many track residual tensors ({len(track_residuals)}) for {len(dit.blocks)} DiT blocks."
+        )
+    residual_offset = len(dit.blocks) - len(track_residuals)
+
+    for block_id, block in enumerate(dit.blocks):
         block.cross_attn.text_token_count = text_token_count
+        if block_id >= residual_offset and len(track_residuals) > 0:
+            residual_id = block_id - residual_offset
+            track_delta = track_residuals[residual_id]
+            track_delta = track_delta.to(dtype=x.dtype, device=x.device)
+            _validate_track_residual_shape(track_delta, x, block_id, residual_id, (f, h, w))
+            x = x + track_delta
         if use_gradient_checkpointing_offload:
             with torch.autograd.graph.save_on_cpu():
                 x = torch.utils.checkpoint.checkpoint(

@@ -233,10 +233,12 @@ def build_wan_inference_config(
     merged_values["module_bases"] = runtime.module_bases
     merged_values["text_mode"] = runtime.text_mode
     merged_values["action_mode"] = runtime.action_mode
+    merged_values["track_mode"] = runtime.track_mode
     merged_values["image_mode"] = runtime.image_mode
     merged_values["enable_text"] = runtime.enable_text
     merged_values["enable_text_encoder"] = runtime.enable_text_encoder
     merged_values["action_enabled"] = runtime.action_enabled
+    merged_values["track_enabled"] = runtime.track_enabled
     merged_values["has_text_input_for_dit"] = runtime.has_text_input_for_dit
     merged_values["model_paths"] = json.dumps(runtime.model_paths)
     merged_values["tokenizer_path"] = runtime.tokenizer_path
@@ -453,19 +455,44 @@ class CheckpointPipelineManager:
         self._info("  - %s", ckpt_path.name)
         return [ckpt_path]
 
-    def initialize_pipeline(self, checkpoints: List[Path]) -> WanVideoPipeline:
+    def initialize_pipeline(
+        self,
+        checkpoints: List[Path],
+        *,
+        num_track_views: Optional[int] = None,
+        track_num_points_per_view: Optional[int] = None,
+    ) -> WanVideoPipeline:
         if checkpoints:
             first_ckpt = checkpoints[0]
             self._info("Using pretrained WAN weights; will apply checkpoint: %s", first_ckpt)
         else:
             self._info("Using pretrained WAN weights only (no checkpoint overlay).")
+        resolved_num_track_views = int(
+            num_track_views
+            if num_track_views is not None
+            else (getattr(self.config, "track_num_views", None) or 1)
+        )
+        resolved_track_points = int(
+            track_num_points_per_view
+            if track_num_points_per_view is not None
+            else (getattr(self.config, "track_num_points_per_view", 256) or 256)
+        )
         self.pipeline = WanVideoPipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
             device=self.device,
             model_configs=self.config.build_model_configs(offload_device="cpu"),
             tokenizer_config=self.config.build_tokenizer_config(),
             modules=list(self.config.modules),
+            num_track_views=max(1, resolved_num_track_views),
+            track_num_points_per_view=max(1, resolved_track_points),
+            track_noise_std=0.0,
         )
+        if self.config.action_enabled or self.config.track_enabled:
+            self._info(
+                "Condition runtime: num_track_views=%s, track_num_points_per_view=%s",
+                max(1, resolved_num_track_views),
+                max(1, resolved_track_points),
+            )
         self._info("Pipeline initialized successfully!\n")
         return self.pipeline
 

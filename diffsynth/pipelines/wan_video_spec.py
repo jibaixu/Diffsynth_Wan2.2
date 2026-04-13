@@ -6,6 +6,7 @@ from typing import Iterable, Literal, Optional, Union
 
 WanTextMode = Literal["off", "t5", "emb"]
 WanActionMode = Literal["off", "noise", "adaln", "cross"]
+WanTrackMode = Literal["off", "residual"]
 WanImageMode = Literal["off", "default", "flat"]
 
 WAN_DEFAULT_MODULES = ("dit", "text", "vae", "image", "action")
@@ -58,10 +59,12 @@ class WanRuntimeConfig:
     module_bases: tuple[str, ...]
     text_mode: WanTextMode
     action_mode: WanActionMode
+    track_mode: WanTrackMode
     image_mode: WanImageMode
     enable_text: bool
     enable_text_encoder: bool
     action_enabled: bool
+    track_enabled: bool
     has_text_input_for_dit: bool
     clip_mode: int
     data_file_keys: tuple[str, ...]
@@ -74,6 +77,7 @@ class WanModuleSpec:
     modules: tuple[str, ...]
     text_mode: WanTextMode
     action_mode: WanActionMode
+    track_mode: WanTrackMode
     image_mode: WanImageMode
 
     @classmethod
@@ -92,6 +96,7 @@ class WanModuleSpec:
         normalized_by_base: dict[str, str] = {}
         text_mode: WanTextMode = "off"
         action_mode: WanActionMode = "off"
+        track_mode: WanTrackMode = "off"
         image_mode: WanImageMode = "default"
 
         def remember(base: str, normalized: str) -> None:
@@ -152,6 +157,17 @@ class WanModuleSpec:
                     continue
                 raise ValueError(f"Unsupported WAN image module spec: {raw_module!r}")
 
+            if base == "track":
+                if variant is None or variant == "residual":
+                    remember("track", "track" if variant is None else "track:residual")
+                    track_mode = "residual"
+                    continue
+                if variant == "off":
+                    drop("track")
+                    track_mode = "off"
+                    continue
+                raise ValueError(f"Unsupported WAN track module spec: {raw_module!r}")
+
             if base in ("dit", "vae"):
                 if variant is not None:
                     raise ValueError(f"Unsupported WAN module variant: {raw_module!r}")
@@ -164,6 +180,7 @@ class WanModuleSpec:
             modules=tuple(normalized_by_base[base] for base in order if base in normalized_by_base),
             text_mode=text_mode,
             action_mode=action_mode,
+            track_mode=track_mode,
             image_mode=image_mode,
         )
 
@@ -182,6 +199,10 @@ class WanModuleSpec:
     @property
     def action_enabled(self) -> bool:
         return self.action_mode != "off"
+
+    @property
+    def track_enabled(self) -> bool:
+        return self.track_mode != "off"
 
     @property
     def has_text_input_for_dit(self) -> bool:
@@ -221,9 +242,13 @@ class WanModuleSpec:
 
         if self.action_enabled:
             ensure("action")
+        else:
+            keys = [key for key in keys if key != "action"]
+
+        if self.action_enabled or self.track_enabled:
             ensure("track")
         else:
-            keys = [key for key in keys if key not in ("action", "track")]
+            keys = [key for key in keys if key != "track"]
 
         model_paths: list[WanModelPath] = []
         for module in self.weight_modules:
@@ -239,10 +264,12 @@ class WanModuleSpec:
             module_bases=self.module_bases,
             text_mode=self.text_mode,
             action_mode=self.action_mode,
+            track_mode=self.track_mode,
             image_mode=self.image_mode,
             enable_text=self.enable_text,
             enable_text_encoder=self.enable_text_encoder,
             action_enabled=self.action_enabled,
+            track_enabled=self.track_enabled,
             has_text_input_for_dit=self.has_text_input_for_dit,
             clip_mode=self.clip_mode,
             data_file_keys=tuple(keys),

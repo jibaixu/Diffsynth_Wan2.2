@@ -9,9 +9,11 @@ from ...models.wan_video_track_encoder import split_legacy_wan_action_encoder_st
 ActionPrefix = "pipe.action_encoder."
 TrackPrefix = "pipe.track_encoder."
 FuserPrefix = "pipe.action_track_fuser."
+TrackAdapterPrefix = "pipe.track_context_adapter."
 BareActionPrefix = "action_encoder."
 BareTrackPrefix = "track_encoder."
 BareFuserPrefix = "action_track_fuser."
+BareTrackAdapterPrefix = "track_context_adapter."
 PipeDitPrefix = "pipe.dit."
 BareDitPrefix = "dit."
 
@@ -22,13 +24,14 @@ class WanCheckpointStats:
     action_key_count: int
     track_key_count: int
     fuser_key_count: int
+    track_adapter_key_count: int
     ignored_key_count: int
 
 
 def _classify_checkpoint_key(
     key: str,
     dit_key_filter: Optional[Callable[[str], bool]] = None,
-) -> tuple[Literal["dit", "action_encoder", "track_encoder", "action_track_fuser", "ignore", "skip"], Optional[str]]:
+) -> tuple[Literal["dit", "action_encoder", "track_encoder", "action_track_fuser", "track_context_adapter", "ignore", "skip"], Optional[str]]:
     if key.startswith(ActionPrefix):
         return "action_encoder", key[len(ActionPrefix):]
     if key.startswith(BareActionPrefix):
@@ -41,6 +44,10 @@ def _classify_checkpoint_key(
         return "action_track_fuser", key[len(FuserPrefix):]
     if key.startswith(BareFuserPrefix):
         return "action_track_fuser", key[len(BareFuserPrefix):]
+    if key.startswith(TrackAdapterPrefix):
+        return "track_context_adapter", key[len(TrackAdapterPrefix):]
+    if key.startswith(BareTrackAdapterPrefix):
+        return "track_context_adapter", key[len(BareTrackAdapterPrefix):]
     if key.startswith(PipeDitPrefix):
         return "dit", key[len(PipeDitPrefix):]
     if key.startswith(BareDitPrefix):
@@ -89,7 +96,7 @@ def load_wan_checkpoint_into_pipeline(
 
     def keep_checkpoint_key(key: str) -> bool:
         target, _ = _classify_checkpoint_key(key, dit_key_filter)
-        return target in ("dit", "action_encoder", "track_encoder", "action_track_fuser")
+        return target in ("dit", "action_encoder", "track_encoder", "action_track_fuser", "track_context_adapter")
 
     state_dict = load_state_dict(
         ckpt_path,
@@ -102,6 +109,7 @@ def load_wan_checkpoint_into_pipeline(
     action_state = {}
     track_state = {}
     fuser_state = {}
+    track_adapter_state = {}
     for key, value in state_dict.items():
         target, normalized_key = _classify_checkpoint_key(key, dit_key_filter)
         if target == "dit":
@@ -112,6 +120,8 @@ def load_wan_checkpoint_into_pipeline(
             track_state[normalized_key] = value
         elif target == "action_track_fuser":
             fuser_state[normalized_key] = value
+        elif target == "track_context_adapter":
+            track_adapter_state[normalized_key] = value
 
     if getattr(pipe, "action_encoder", None) is not None and getattr(pipe, "track_encoder", None) is not None and len(track_state) == 0:
         adapted_action_state, adapted_track_state, legacy_message = split_legacy_wan_action_encoder_state_dict(
@@ -141,6 +151,7 @@ def load_wan_checkpoint_into_pipeline(
     load_component("action_encoder", getattr(pipe, "action_encoder", None), action_state)
     load_component("track_encoder", getattr(pipe, "track_encoder", None), track_state)
     load_component("action_track_fuser", getattr(pipe, "action_track_fuser", None), fuser_state)
+    load_component("track_context_adapter", getattr(pipe, "track_context_adapter", None), track_adapter_state)
 
     if len(action_state) > 0 and getattr(pipe, "track_encoder", None) is not None and len(track_state) == 0:
         log_warning("  - track_encoder weights missing; using initialized weights")
@@ -155,5 +166,6 @@ def load_wan_checkpoint_into_pipeline(
         action_key_count=len(action_state),
         track_key_count=len(track_state),
         fuser_key_count=len(fuser_state),
+        track_adapter_key_count=len(track_adapter_state),
         ignored_key_count=ignored_key_count,
     )
